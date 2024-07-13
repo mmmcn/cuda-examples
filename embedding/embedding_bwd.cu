@@ -77,6 +77,59 @@ __device__ void atomicAdd(bfloat16_t* address, bfloat16_t val) {
     } while(assumed != old);
 }
 
+__device__ void atomicAdd(float162_t* address, float162_t val) {
+    // mimic vectorized atomicAdd, though dont know how cuda implements internally
+    unsigned int* address_as_ui = (unsigned int*)((char*)address - ((size_t)address & 2));
+    unsigned int old = *address_as_ui;
+    unsigned int assumed;
+
+    do {
+        assumed = old;
+        uint16_t sum = ((size_t)address & 2) ? (old >> 16) : (old & 0xffff);  // little endian
+        float new_val = __half2float(__ushort_as_half(sum)) + static_cast<float>(val.x);
+        uint16_t newval_u = __half_as_ushort(__float2half(new_val));
+        old = ((size_t)address & 2) ? (old & 0xffff) | (newval_u << 16) : (old & 0xffff0000) | newval_u;
+        old = atomicCAS(address_as_ui, assumed, old);
+    } while (assumed != old);
+
+    address_as_ui = ((size_t)address & 2) ? (unsigned int*)((char*)address + 4): address_as_ui;
+    old = *address_as_ui;
+    do {
+        assumed = old;
+        uint16_t sum = ((size_t)address & 2) ? (old & 0xffff) : (old >> 16);
+        float new_val = __half2float(__ushort_as_half(sum)) + static_cast<float>(val.y);
+        uint16_t newval_u = __half_as_ushort(__float2half(new_val));
+        old = ((size_t)address & 2) ? (old & 0xffff0000) | newval_u : (old & 0xffff) | (newval_u << 16);
+        old = atomicCAS(address_as_ui, assumed, old);
+    } while (assumed != old);
+}
+
+__device__ void atomicAdd(bfloat162_t* address, bfloat162_t val) {
+    unsigned int* address_as_ui = (unsigned int*)((char*)address - ((size_t)address & 2));
+    unsigned int old = *address_as_ui;
+    unsigned int assumed;
+
+    do {
+        assumed = old;
+        uint16_t sum = ((size_t)address & 2) ? (old >> 16) : (old & 0xffff);  // little endian
+        float new_val = __bfloat162float(__ushort_as_bfloat16(sum)) + static_cast<float>(val.x);
+        uint16_t newval_u = __bfloat16_as_ushort(__float2bfloat16(new_val));
+        old = ((size_t)address & 2) ? (old & 0xffff) | (newval_u << 16) : (old & 0xffff0000) | newval_u;
+        old = atomicCAS(address_as_ui, assumed, old);
+    } while (assumed != old);
+
+    address_as_ui = ((size_t)address & 2) ? (unsigned int*)((char*)address + 4): address_as_ui;
+    old = *address_as_ui;
+    do {
+        assumed = old;
+        uint16_t sum = ((size_t)address & 2) ? (old & 0xffff) : (old >> 16);
+        float new_val = __bfloat162float(__ushort_as_bfloat16(sum)) + static_cast<float>(val.y);
+        uint16_t newval_u = __bfloat16_as_ushort(__float2bfloat16(new_val));
+        old = ((size_t)address & 2) ? (old & 0xffff0000) | newval_u : (old & 0xffff) | (newval_u << 16);
+        old = atomicCAS(address_as_ui, assumed, old);
+    } while (assumed != old);
+}
+
 }  // namespace custom
 
 template <typename scalar_t>

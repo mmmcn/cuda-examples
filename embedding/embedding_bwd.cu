@@ -21,11 +21,6 @@
 #define NUM_REPEAT 5
 
 
-typedef __nv_half float16_t;
-typedef __nv_half2 float162_t;
-typedef __nv_bfloat16 bfloat16_t;
-typedef __nv_bfloat162 bfloat162_t;
-
 template <typename T>
 struct vec2_type_traits;
 

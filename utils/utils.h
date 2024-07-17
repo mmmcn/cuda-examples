@@ -6,6 +6,22 @@
 #include <optional>
 
 #include "cuda_runtime.h"
+#include "cuda_fp16.h"
+#include "cuda_bf16.h"
+
+typedef __nv_half float16_t;
+typedef __nv_half2 float162_t;
+typedef __nv_bfloat16 bfloat16_t;
+typedef __nv_bfloat162 bfloat162_t;
+
+#define CHECK_CUDA(call)                                                        \
+  do {                                                                          \
+    cudaError_t error = call;                                                   \
+    if (error != cudaSuccess) {                                                 \
+        std::cerr << "CUDA error: " << cudaGetErrorString(error) << std::endl;  \
+        exit(EXIT_FAILURE);                                                     \
+    }                                                                           \
+  } while (0)
 
 
 struct GPUTimer {

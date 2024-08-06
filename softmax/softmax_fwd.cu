@@ -6,9 +6,10 @@
 
 #include "../utils/utils.h"
 
-#define N 64
+// 512M
+#define N 128 * 1024
 #define C 1024
-#define BLOCK_SIZE 32
+#define BLOCK_SIZE 256
 #define NUM_REPEAT 4
 
 // assume the input memory format always contiguous, and inner size is 1
@@ -176,6 +177,36 @@ __global__ void softmaxForwardKernel3(float* output_data, const float* input_dat
     for (int i = tid; i < c; i += blockDim.x) {
         maxval = fmaxf(maxval, input_data[bid * c + i]);
     }
+    // we're using __shfl_xor_sync, so no need to broadcast maxval
+    maxval = warpReduce<Max>(maxval);
+
+    for (int i = tid; i < c; i += blockDim.x) {
+        output_data[bid * c + i] = expf(input_data[bid * c + i] - maxval);
+    }
+
+    // calculate sum
+    float sum = 0.0f;
+    for (int i = tid; i < c; i += blockDim.x) {
+        sum += output_data[bid * c + i];
+    }
+    sum = warpReduce<Add>(sum);
+
+    for (int i = tid; i < c; i += blockDim.x) {
+        output_data[bid * c + i] /= sum;
+    }
+}
+
+__global__ void softmaxForwardKernel4(float* output_data, const float* input_data, int n, int c) {
+    // warp level reduce
+    // different from Kernel3, we may have more than one warps in each block, each warp process one row
+    uint32_t bid = blockIdx.x * blockDim.y + threadIdx.y;
+    uint32_t tid = threadIdx.x;
+
+    float maxval = -INFINITY;
+    // calculate max
+    for (int i = tid; i < c; i += blockDim.x) {
+        maxval = fmaxf(maxval, input_data[bid * c + i]);
+    }
     // we're using __shfl_xor_sync, so no need to broadcast maxval 
     maxval = warpReduce<Max>(maxval);
 
@@ -195,6 +226,112 @@ __global__ void softmaxForwardKernel3(float* output_data, const float* input_dat
     }
 }
 
+__global__ void softmaxForwardKernel5(float* output_data, const float* input_data, int n, int c) {
+    // warp level reduce, using online softmax
+    uint32_t bid = blockIdx.x * blockDim.y + threadIdx.y;
+    uint32_t tid = threadIdx.x;
+
+    float maxval = -INFINITY;
+    float sumval = 0.0f;
+    // calculate max and sum, assign to each Lane
+    for (int i = tid; i < c; i += blockDim.x) {
+        if (input_data[bid * c + i] > maxval) {
+            float pre_maxval = maxval;
+            maxval = input_data[bid * c + i];
+            sumval = sumval * expf(pre_maxval - maxval) + 1.0f;
+        } else {
+            sumval += expf(input_data[bid * c + i] - maxval);
+        }
+    }
+
+    // now, do warp reduce
+    float offset_sum;
+    float offset_max;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        // __shfl_xor_sync(0xFFFFFFFF, val, offset);
+       offset_max =  __shfl_xor_sync(0xFFFFFFFF, maxval, offset);
+       offset_sum = __shfl_xor_sync(0xFFFFFFFF, sumval, offset);
+
+       if (offset_max > maxval) {
+          sumval *= expf(maxval - offset_max);
+          maxval = offset_max;
+       } else {
+          offset_sum *= expf(offset_max - maxval);
+       }
+       sumval += offset_sum;
+    }
+
+    // no need to broadcast
+    for (int i = tid; i < c; i += blockDim.x) {
+        output_data[bid * c + i] = expf(input_data[bid * c + i] - maxval) / sumval;
+    }
+}
+
+__global__ void softmaxForwardKernel6(float* output_data, const float* input_data, int n, int c) {
+    // this kernel should be more efficient when c is larger
+    extern __shared__ float shm[];
+    uint32_t bid = blockIdx.x;
+    uint32_t tid = threadIdx.x;
+
+    uint32_t warpId = tid / 32;
+    uint32_t laneId = tid % 32;
+
+    float maxval = -INFINITY;
+    for (int i = tid; i < c; i += blockDim.x) {
+        maxval = fmaxf(maxval, input_data[bid * c + tid]);
+    }
+    // reduce-max in each warp
+    maxval = warpReduce<Max>(maxval);
+
+    if (laneId == 0) {
+        shm[warpId] = maxval;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        for (int i = 0; i < blockDim.x / 32; i++) {
+            maxval = fmaxf(maxval, shm[i]);
+        }
+        shm[0] = maxval;
+    }
+    __syncthreads();
+
+    // broadcast maxval to all threads
+    float maxval_bd = shm[0];
+
+    for (int i = tid; i < c; i += blockDim.x) {
+        output_data[bid * c + i] = expf(input_data[bid * c + i] - maxval_bd);
+    }
+
+    float sum = 0.0f;
+    for (int i = tid; i < c; i += blockDim.x) {
+        sum += output_data[bid * c + i];
+    }
+    sum = warpReduce<Add>(sum);
+
+    if (laneId == 0) {
+        shm[warpId] = sum;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        float val = shm[0];
+        for (int i = 1; i < blockDim.x / 32; i++) {
+            val += shm[i];
+        }
+        shm[0] = val;
+    }
+    __syncthreads();
+
+    // broadcast global sum into all threads
+    float sum_bd = shm[0];
+
+    for (int i = tid; i < c; i += blockDim.x) {
+        output_data[bid * c + i] /= sum_bd;
+    }
+}
+
 void benchmark_cpu() {
     // naive version vs online version
     float* input_data = (float*)malloc(N * C * sizeof(float));
@@ -202,16 +339,16 @@ void benchmark_cpu() {
     float* output_data2 = (float*)malloc(N * C * sizeof(float));
     randomInitFloat(input_data, N * C, -2, 2);
 
-    constexpr int repeat = 10;
+    constexpr int repeat = NUM_REPEAT;
     auto start = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < repeat; i++) softmaxForwardCPU(output_data1, input_data, N, C);
     auto end = std::chrono::high_resolution_clock::now();
-    std::cout << "naive version cost " << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / (1.f * repeat) << " ns\n";
+    std::cout << "naive version cost " << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / (1.f * repeat) << " us\n";
 
     start = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < repeat; i++) softmaxForwardOnlineCPU(output_data2, input_data, N, C);
     end = std::chrono::high_resolution_clock::now();
-    std::cout << "online version cost " << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / (1.f * repeat) << " ns\n";
+    std::cout << "online version cost " << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / (1.f * repeat) << " us\n";
 
     checkResult(output_data1, output_data2, N * C);
     
@@ -237,6 +374,36 @@ void run_softmax_kernel3(float* output, const float* input) {
     constexpr int block_size = 32;  // we use warp reduce in this kernel, so block_size should be 32
     for (int i = 0; i < NUM_REPEAT; i++) {
         softmaxForwardKernel3<<<N, block_size>>>(output, input, N, C);
+    }
+}
+
+void run_softmax_kernel4(float* output, const float* input) {
+    constexpr int threads_per_block = 256;
+    const int warps_per_block = threads_per_block / 32;
+
+    dim3 block(32, warps_per_block, 1);
+    dim3 grid(ceil_div(N, warps_per_block), 1, 1);
+    for (int i = 0; i < NUM_REPEAT; i++) {
+        softmaxForwardKernel4<<<grid, block>>>(output, input, N, C);
+    }
+}
+
+void run_softmax_kernel5(float* output, const float* input) {
+    constexpr int threads_per_block = 256;
+    const int warps_per_block = threads_per_block / 32;
+
+    dim3 block(32, warps_per_block, 1);
+    dim3 grid(ceil_div(N, warps_per_block), 1, 1);
+    for (int i = 0; i < NUM_REPEAT; i++) {
+        softmaxForwardKernel5<<<grid, block>>>(output, input, N, C);
+    }
+}
+
+void run_softmax_kernel6(float* output, const float* input) {
+    constexpr int block_size = 256;
+    const int shm_size = block_size / 32 * sizeof(float);
+    for (int i = 0; i < NUM_REPEAT; i++) {
+        softmaxForwardKernel6<<<N, block_size, shm_size>>>(output, input, N, C);
     }
 }
 
@@ -267,6 +434,15 @@ int main(int argc, char* argv[]) {
                 break;
             case 3:
                 run_softmax_kernel3(device_output_data, device_input_data);
+                break;
+            case 4:
+                run_softmax_kernel4(device_output_data, device_input_data);
+                break;
+            case 5:
+                run_softmax_kernel5(device_output_data, device_input_data);
+                break;
+            case 6:
+                run_softmax_kernel6(device_output_data, device_input_data);
                 break;
         }
         // check result

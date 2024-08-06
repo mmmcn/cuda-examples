@@ -4,6 +4,7 @@
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <random>
 
 #include "cuda_runtime.h"
 #include "cuda_fp16.h"
@@ -71,5 +72,19 @@ private:
   cudaEvent_t _stop;
   std::optional<cudaStream_t> _stream;
 };
+
+template <typename T>
+inline void randomInitFloat(T* data, int64_t numel, int low=-1, int high=1) {
+    std::mt19937 gen_f(114514);
+    std::uniform_real_distribution<> dis_f(low, high);
+    for (int i = 0; i < numel; i++) {
+        data[i] = static_cast<T>(dis_f(gen_f));
+    }
+}
+
+template <typename T>
+__host__ __device__ T ceil_div(T a, T b) {
+  return (a + b - 1) / b;
+}
 
 #endif  // UTILS_UTILS_H_

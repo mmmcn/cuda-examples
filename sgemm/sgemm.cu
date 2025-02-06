@@ -9,6 +9,7 @@
 
 #include "kernels/sgemm_naive.cuh"
 #include "kernels/sgemm_v2.cuh"
+#include "kernels/sgemm_v3.cuh"
 #include "../utils/utils.h"
 
 #define M 2048
@@ -18,7 +19,7 @@
 
 // for profiling
 #define NUM_WARMUP 2
-#define NUM_REPEAT 2
+#define NUM_REPEAT 5
 
 
 void run_sgemm_cpu(float* A, float* B, float* C, int m, int n, int k, float alpha=1.0, float beta=0.0) {
@@ -76,6 +77,22 @@ void run_sgemm_v2(float* A, float* B, float* C, int m, int n, int k, float alpha
 }
 
 
+void run_sgemm_v3(float* A, float* B, float* C, int m, int n, int k, float alpha=1.0, float beta=0.0) {
+    // 64, 64, 4, 4, 4
+    // 128, 128, 8, 8, 8
+    constexpr int TILE_M = 128;
+    constexpr int TILE_N = 128;
+    constexpr int TILE_K = 8;
+    constexpr int TM = 8;
+    constexpr int TN = 8;
+    constexpr int BLOCK_SIZE = (TILE_M / TM) * (TILE_N / TN);
+    dim3 block(BLOCK_SIZE);
+    dim3 grid = {ceil_div((uint32_t)m, (uint32_t)TILE_M), ceil_div((uint32_t)n, (uint32_t)TILE_N), 1};
+
+    perf([&]() { sgemm_v3_kernel<TILE_M, TILE_N, TILE_K, TM, TN, BLOCK_SIZE><<<grid, block>>>(C, A, B, m, n, k, alpha, beta); }, "sgemm_v3_kernel");
+}
+
+
 inline bool check_result(float* actual, float* desired, int64_t numel){
     constexpr float abs_diff = 1e-2;
     bool passed = true;
@@ -118,7 +135,12 @@ int main(int argc, char* argv[]) {
             run_sgemm_naive(device_A, device_B, device_C, M, N, K);
             break;
         case 2:
+            // shared memory caching
             run_sgemm_v2(device_A, device_B, device_C, M, N, K);
+            break;
+        case 3:
+            // 2d tiling
+            run_sgemm_v3(device_A, device_B, device_C, M, N, K);
             break;
         default:
             throw std::invalid_argument("invalid kernel number");
